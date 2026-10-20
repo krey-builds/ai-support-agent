@@ -1,0 +1,864 @@
+{
+  "name": "1 - Embed Knowledge Base",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP — status as of 2026-08-25: already wired, nothing left to configure\n\nThis workflow reads your Airtable \"Knowledge Base\" table (Question, Answer, Category, Active, Embedding Status, Last Embedded At, Embed Error Message) and embeds every Active row into the same Supabase `documents` table Workflow 2 searches at answer time. Run it by hand any time you add or edit FAQ rows.\n\n**Already wired, nothing left to configure:**\n- Airtable base `AI Customer Support Agent` / table `Knowledge Base` — real IDs on every node, not placeholders.\n- Credentials: \"Airtable Personal Access Token (Support Agent)\", \"Google Gemini API\", \"Supabase API (Support Agent Knowledge Base)\" — all attached with real credential IDs, confirmed against the live node config (not just picked by name — see the auto-attach warning in project history if re-wiring this from scratch ever becomes necessary).\n- Supabase: pgvector extension on, `documents` table + `match_documents()` function deployed at **vector(3072)** — confirmed against a real failed insert 2026-08-22 (n8n's own node description claims 768, which is wrong for this model). Rebuild recipe if ever needed: `temp/outputs/supabase-fix-embedding-dimension.sql`.\n\n**Fixed 2026-08-25, full-system audit:** \"Store KB Embedding\" was silently reporting success on real Supabase failures — the same vectorStoreSupabase error-shape bug already fixed in Workflows 2 and 4, just not yet applied here since this workflow had never actually been run. Switched to continueErrorOutput; added a \"Search OK?\" gate after the Airtable read so a search failure stops the run instead of embedding garbage. See node notes below.\n\nThis workflow starts with a Manual Trigger — click the button in n8n to run it.",
+        "height": 460,
+        "width": 900,
+        "color": 7
+      },
+      "id": "sticky_setup_0",
+      "name": "Sticky Note - SETUP",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -704
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1. Wipe Old Vectors First\nDeletes every row in the Supabase `documents` table before anything else runs, so a re-run of this workflow never leaves duplicate or stale vectors sitting next to freshly embedded ones. If the wipe fails, the run stops right here — nothing gets read from Airtable and nothing gets re-embedded until the table is confirmed empty.\n\nRun order is deliberately Wipe → Read → Embed (not Read → Wipe → Embed) so the wipe happens exactly once per run instead of once per FAQ row.",
+        "height": 560,
+        "width": 780,
+        "color": 4
+      },
+      "id": "sticky_section1_1",
+      "name": "Section - 1. Wipe Old Vectors First",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2. Read Active FAQ Rows\nOnly rows where Active is ticked get read and re-embedded — untick Active on any row you don't want the AI using yet.",
+        "height": 300,
+        "width": 340,
+        "color": 5
+      },
+      "id": "sticky_section2_2",
+      "name": "Section - 2. Read Active FAQ Rows",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        784,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 3. Embed One Row at a Time\nOne FAQ row per AI embedding call, never batched. Each row's Question + Answer becomes the searchable text; Category and the Airtable record ID travel along as metadata so a future retrieval can be traced back to its source row. Every row gets its own status written back to Airtable — Embedded or Embed Error — so you can see exactly which rows are actually usable by the live support agent (Workflow 2).",
+        "height": 1000,
+        "width": 1600,
+        "color": 6
+      },
+      "id": "sticky_section3_3",
+      "name": "Section - 3. Embed One Row at a Time",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1088,
+        -368
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "start_embedding_run_4",
+      "name": "Start Embedding Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "tableId": "documents",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "gte",
+              "keyValue": "0"
+            }
+          ]
+        }
+      },
+      "id": "wipe_existing_kb_vectors_5",
+      "name": "Wipe Existing KB Vectors",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        288,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_ME",
+          "name": "Supabase API"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Deletes every row in the 'documents' table so a re-run never leaves duplicate/stale vectors next to fresh ones. The filter (id >= 0) assumes the standard Supabase+LangChain schema (id bigserial primary key) — if your table uses a different primary key type (e.g. uuid), edit this condition to match it. CREDENTIAL: select or create \"Supabase API (Support Agent Knowledge Base)\" here — left with no id on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ String($json.error ? '' : 'ok') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wipe_ok_6",
+      "name": "Wipe OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        560,
+        0
+      ],
+      "notes": "True = the delete call came back with no error. False stops the run entirely (see 'Wipe Failed - Run Stopped') so nothing ever gets read from Airtable or re-embedded on top of a table that might still be holding old vectors."
+    },
+    {
+      "parameters": {},
+      "id": "wipe_failed_run_stopped_7",
+      "name": "Wipe Failed - Run Stopped",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        848,
+        288
+      ],
+      "notes": "Dead end by design. Open this execution's log and check the Supabase error — usually a bad credential, the 'documents' table not existing yet, or the pgvector extension not enabled. Nothing was read from Airtable and nothing was embedded. Fix the Supabase issue, then click Start Embedding Run again."
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "mode": "id",
+          "value": "appREPLACEWITHBASE",
+          "cachedResultName": "AI Customer Support Agent"
+        },
+        "table": {
+          "mode": "id",
+          "value": "tblREPLACEWITHTABL",
+          "cachedResultName": "Knowledge Base"
+        },
+        "filterByFormula": "{Active}=1",
+        "options": {}
+      },
+      "id": "get_active_kb_rows_8",
+      "name": "Get Active KB Rows",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        848,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable Personal Access Token"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Base/Table point at the real 'Knowledge Base' table. Only rows with Active ticked get embedded. CREDENTIAL: select or create \"Airtable Personal Access Token (Support Agent)\" here — left with no id on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only."
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "loop_over_kb_rows_9",
+      "name": "Loop Over KB Rows",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1120,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "all_kb_rows_embedded_10",
+      "name": "All KB Rows Embedded",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1104,
+        -528
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "pageContent",
+              "type": "string",
+              "value": "={{ 'Question: ' + ($json.fields['Question'] || '') + '\\nAnswer: ' + ($json.fields['Answer'] || '') }}"
+            },
+            {
+              "id": "a1",
+              "name": "metadata",
+              "type": "object",
+              "value": "={{ { category: $json.fields['Category'] || '', airtable_record_id: $json.id } }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "build_document_text_11",
+      "name": "Build Document Text",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1408,
+        0
+      ],
+      "notes": "Only pageContent + metadata go downstream on purpose — the Default Data Loader (in 'Load All Input Data' mode) reads exactly these two fields to build the document that gets embedded. metadata.airtable_record_id is what would let a future retrieval be traced back to its source FAQ row."
+    },
+    {
+      "parameters": {},
+      "id": "gemini_embeddings_kb_12",
+      "name": "Gemini Embeddings (KB)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1408,
+        272
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_ME",
+          "name": "Google Gemini API"
+        }
+      },
+      "notes": "Default model (gemini-embedding-001) produces 3072-dimension vectors, confirmed against a real execution 2026-08-22 — n8n's own node description incorrectly claims 768. Your Supabase 'documents' table's embedding column must be vector(3072) or every insert below will fail with a dimension mismatch. CREDENTIAL: select or create \"Google Gemini API\" here — left with no id on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only."
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "default_data_loader_13",
+      "name": "Default Data Loader",
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1.1,
+      "position": [
+        1536,
+        464
+      ],
+      "notes": "Simple splitting (1000 chars / 200 overlap) is overkill for one FAQ answer at a time but harmless — a Question+Answer pair almost never reaches 1000 characters, so in practice each row stays a single chunk."
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "tableName": {
+          "mode": "id",
+          "value": "documents",
+          "cachedResultName": "documents"
+        },
+        "options": {}
+      },
+      "id": "store_kb_embedding_14",
+      "name": "Store KB Embedding",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.3,
+      "position": [
+        1680,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 30000,
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_ME",
+          "name": "Supabase API"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "The 'documents' table, the pgvector extension, and the match_documents() RPC function must already exist in Supabase before this runs. CREDENTIAL: select or create \"Supabase API (Support Agent Knowledge Base)\" here.\n\n2026-08-25: switched to continueErrorOutput. The old setup (continueRegularOutput + a downstream IF checking $json.error) is a confirmed silent-failure bug on this exact node type — vectorStoreSupabase does not populate an error field on failure, so a real insert failure would have been reported as success and the Airtable row marked Embedded when nothing was actually stored. Its two real outputs (0=success, 1=failure) now wire directly to the two Update KB Row nodes."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": {
+          "mode": "id",
+          "value": "appREPLACEWITHBASE",
+          "cachedResultName": "AI Customer Support Agent"
+        },
+        "table": {
+          "mode": "id",
+          "value": "tblREPLACEWITHTABL",
+          "cachedResultName": "Knowledge Base"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Get Active KB Rows').item.json.id }}",
+            "Embedding Status": "Embedded",
+            "Last Embedded At": "={{ $now.toISO() }}",
+            "Embed Error Message": ""
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true
+            },
+            {
+              "id": "Question",
+              "displayName": "Question",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Answer",
+              "displayName": "Answer",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Active",
+              "displayName": "Active",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Embedding Status",
+              "displayName": "Embedding Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Not Embedded",
+                  "value": "Not Embedded"
+                },
+                {
+                  "name": "Embedded",
+                  "value": "Embedded"
+                },
+                {
+                  "name": "Embed Error",
+                  "value": "Embed Error"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Last Embedded At",
+              "displayName": "Last Embedded At",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Embed Error Message",
+              "displayName": "Embed Error Message",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "id": "update_kb_row_embedded_16",
+      "name": "Update KB Row - Embedded",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        2240,
+        -160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable Personal Access Token"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Writes only the 3 fields this workflow owns (Embedding Status, Last Embedded At, Embed Error Message) — never touches Question/Answer/Category/Active, those stay the operator's. CREDENTIAL: select or create \"Airtable Personal Access Token (Support Agent)\" here — left with no id on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": {
+          "mode": "id",
+          "value": "appREPLACEWITHBASE",
+          "cachedResultName": "AI Customer Support Agent"
+        },
+        "table": {
+          "mode": "id",
+          "value": "tblREPLACEWITHTABL",
+          "cachedResultName": "Knowledge Base"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Get Active KB Rows').item.json.id }}",
+            "Embedding Status": "Embed Error",
+            "Embed Error Message": "={{ String($json.error || 'Unknown error while embedding this row.') }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true
+            },
+            {
+              "id": "Question",
+              "displayName": "Question",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Answer",
+              "displayName": "Answer",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Active",
+              "displayName": "Active",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Embedding Status",
+              "displayName": "Embedding Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Not Embedded",
+                  "value": "Not Embedded"
+                },
+                {
+                  "name": "Embedded",
+                  "value": "Embedded"
+                },
+                {
+                  "name": "Embed Error",
+                  "value": "Embed Error"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Last Embedded At",
+              "displayName": "Last Embedded At",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Embed Error Message",
+              "displayName": "Embed Error Message",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "id": "update_kb_row_embed_error_17",
+      "name": "Update KB Row - Embed Error",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        2240,
+        192
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable Personal Access Token"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Leaves Last Embedded At untouched on purpose — an error means nothing new was embedded, so the last successful timestamp (if any) should stay put. CREDENTIAL: select or create \"Airtable Personal Access Token (Support Agent)\" here — left with no id on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only."
+    },
+    {
+      "parameters": {
+        "amount": 0.2
+      },
+      "id": "wait_200ms_18",
+      "name": "Wait 200ms",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2528,
+        0
+      ],
+      "webhookId": "35efb3be-cff9-5392-8356-526923286d44"
+    },
+    {
+      "id": "bd612b8b-94b5-4a2c-ac1e-62d965922b9e",
+      "name": "Search OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        848,
+        288
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ String($json.error ? '' : 'ok') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "True = the Airtable search came back with no error. False stops the run (see 'Search Failed - Run Stopped') rather than looping over a single error-shaped item as if it were a real KB row — which would have built garbage pageContent and embedded it. Mirrors 'Wipe OK?' earlier in this same workflow."
+    },
+    {
+      "id": "10c99a41-5878-4d2e-be23-339d3f6cd900",
+      "name": "Search Failed - Run Stopped",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        480
+      ],
+      "parameters": {},
+      "notes": "Dead end by design. Open this execution's log and check the Airtable error on 'Get Active KB Rows' — usually a bad credential or the Knowledge Base table/base ID being wrong. Nothing was embedded. Fix the Airtable issue, then click Start Embedding Run again."
+    }
+  ],
+  "connections": {
+    "Start Embedding Run": {
+      "main": [
+        [
+          {
+            "node": "Wipe Existing KB Vectors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wipe Existing KB Vectors": {
+      "main": [
+        [
+          {
+            "node": "Wipe OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wipe OK?": {
+      "main": [
+        [
+          {
+            "node": "Get Active KB Rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wipe Failed - Run Stopped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over KB Rows": {
+      "main": [
+        [
+          {
+            "node": "All KB Rows Embedded",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Document Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Document Text": {
+      "main": [
+        [
+          {
+            "node": "Store KB Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Embeddings (KB)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Store KB Embedding",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Default Data Loader": {
+      "ai_document": [
+        [
+          {
+            "node": "Store KB Embedding",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update KB Row - Embedded": {
+      "main": [
+        [
+          {
+            "node": "Wait 200ms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update KB Row - Embed Error": {
+      "main": [
+        [
+          {
+            "node": "Wait 200ms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 200ms": {
+      "main": [
+        [
+          {
+            "node": "Loop Over KB Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store KB Embedding": {
+      "main": [
+        [
+          {
+            "node": "Update KB Row - Embedded",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update KB Row - Embed Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Active KB Rows": {
+      "main": [
+        [
+          {
+            "node": "Search OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search OK?": {
+      "main": [
+        [
+          {
+            "node": "Loop Over KB Rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Failed - Run Stopped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "binaryMode": "separate"
+  },
+  "staticData": null
+}

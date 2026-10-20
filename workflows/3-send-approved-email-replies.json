@@ -1,0 +1,642 @@
+{
+  "name": "3 - Send Approved Email Replies",
+  "nodes": [
+    {
+      "id": "sticky_setup_0",
+      "name": "Sticky Note - SETUP",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -48,
+        -688
+      ],
+      "parameters": {
+        "content": "## SETUP — do this first\n\nThis piece runs quietly every 15 minutes, checking Airtable for email drafts you've ticked \"Approved.\" The moment it finds one, it sends the real email to the customer — there is no second confirmation. The 15-minute poll interval is a deliberate safety buffer: if you tick the box by accident, you have a window to un-tick it before anything actually goes out. Don't shrink this interval without a reason.\n\n1. In Airtable, the \"Email Drafts Pending Approval\" table needs to exist first (built alongside Workflow 2) with these exact columns: Customer Email, Subject, Draft Body, Original Gmail Message ID, Original Gmail Thread ID, Approved (checkbox — only you ever tick this, no workflow writes it), Sent, Sent At, Send Error.\n2. Click every Airtable node below and set its Base + Table to the real ones. A placeholder value is pre-filled on purpose so this can never silently write to the wrong base — n8n auto-attaches an unrelated existing resource if a name is given with no real ID.\n3. Click every Airtable node and pick your Airtable Personal Access Token credential.\n4. Click the Gmail node and pick your Gmail OAuth2 credential — the same Google account Workflow 2 watches, so replies land as that inbox.",
+        "height": 300,
+        "width": 1780,
+        "color": 7
+      }
+    },
+    {
+      "id": "section_1_sticky_1",
+      "name": "Section - 1. Poll for Approved, Unsent Drafts",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -48,
+        -368
+      ],
+      "parameters": {
+        "content": "### 1. Poll for Approved, Unsent Drafts\nEvery 15 minutes: pull every row where you've ticked Approved and Sent is still empty. Nothing here decides anything — it just finds the work waiting for it.",
+        "height": 560,
+        "width": 780,
+        "color": 4
+      }
+    },
+    {
+      "id": "section_2_sticky_2",
+      "name": "Section - 2. Send Each One, Log the Result",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        768,
+        -368
+      ],
+      "parameters": {
+        "content": "### 2. Send Each One, Log the Result\nOne draft at a time. The reply lands in the original email thread because it uses the stored Gmail Message ID — n8n's Reply operation threads it automatically. On success: Sent + Sent At get written. On failure: only Send Error gets written, Sent stays unticked on purpose so the next poll (15 minutes later) retries this row automatically. Approved is never touched here — that checkbox belongs to you alone.",
+        "height": 700,
+        "width": 1180,
+        "color": 5
+      }
+    },
+    {
+      "id": "poll_every_15_minutes_3",
+      "name": "Poll Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "get_approved_unsent_drafts_4",
+      "name": "Get Approved Unsent Drafts",
+      "notes": "Gate: Approved ticked AND Sent not ticked. CREDENTIAL: pick your Airtable Personal Access Token here — left as a placeholder on purpose. BASE/TABLE: click in and set Base + Table to the real 'Email Drafts Pending Approval' table once it exists — a placeholder ID is pre-filled so this can never silently point at the wrong base.",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "position": [
+        288,
+        0
+      ],
+      "parameters": {
+        "operation": "search",
+        "base": {
+          "mode": "id",
+          "value": "appREPLACEWITHBASE",
+          "cachedResultName": "AI Customer Support Agent"
+        },
+        "table": {
+          "mode": "id",
+          "value": "tblREPLACEWITHTABL",
+          "cachedResultName": "Email Drafts Pending Approval"
+        },
+        "filterByFormula": "AND({Approved}=1, {Sent}!=1)",
+        "options": {}
+      },
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable Personal Access Token"
+        }
+      }
+    },
+    {
+      "id": "loop_over_drafts_5",
+      "name": "Loop Over Drafts",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "options": {}
+      }
+    },
+    {
+      "id": "all_replies_sent_6",
+      "name": "All Replies Sent",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        560,
+        -288
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "send_approved_reply_7",
+      "name": "Send Approved Reply",
+      "webhookId": "8ccf0610-8b0a-548b-8056-4d16b1716240",
+      "notes": "CREDENTIAL: pick your Gmail OAuth2 credential here (same inbox Workflow 2 watches) — left as a placeholder on purpose. Uses the Reply operation against the stored Original Gmail Message ID, which threads the reply into the original conversation automatically. The Reply operation has no separate Thread ID field — n8n derives the thread from the message being replied to, so the Original Gmail Thread ID column exists in Airtable for record-keeping but isn't needed here.",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "position": [
+        848,
+        0
+      ],
+      "parameters": {
+        "operation": "reply",
+        "messageId": "={{ $('Get Approved Unsent Drafts').item.json.fields['Original Gmail Message ID'] }}",
+        "emailType": "text",
+        "message": "={{ $('Get Approved Unsent Drafts').item.json.fields['Draft Body'] }}",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "id": "send_ok_8",
+      "name": "Send OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ String(($json.id) || '') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mark_draft_as_sent_9",
+      "name": "Mark Draft as Sent",
+      "notes": "Writes ONLY Sent + Sent At — never touches Approved (operator-only) or any other field. CREDENTIAL: pick your Airtable Personal Access Token here — left as a placeholder on purpose. BASE/TABLE: set to the real 'Email Drafts Pending Approval' table.",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "position": [
+        1408,
+        -160
+      ],
+      "parameters": {
+        "operation": "update",
+        "base": {
+          "mode": "id",
+          "value": "appREPLACEWITHBASE",
+          "cachedResultName": "AI Customer Support Agent"
+        },
+        "table": {
+          "mode": "id",
+          "value": "tblREPLACEWITHTABL",
+          "cachedResultName": "Email Drafts Pending Approval"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Get Approved Unsent Drafts').item.json.id }}",
+            "Sent": true,
+            "Sent At": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true
+            },
+            {
+              "id": "Customer Email",
+              "displayName": "Customer Email",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Subject",
+              "displayName": "Subject",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Draft Body",
+              "displayName": "Draft Body",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Original Gmail Message ID",
+              "displayName": "Original Gmail Message ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Original Gmail Thread ID",
+              "displayName": "Original Gmail Thread ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Approved",
+              "displayName": "Approved",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Sent",
+              "displayName": "Sent",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Sent At",
+              "displayName": "Sent At",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Send Error",
+              "displayName": "Send Error",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable Personal Access Token"
+        }
+      }
+    },
+    {
+      "id": "log_send_failure_10",
+      "name": "Log Send Failure",
+      "notes": "Writes ONLY Send Error. Sent is deliberately left untouched (stays unticked) so the next 15-minute poll retries this row automatically — never marks Sent on failure, never touches Approved. CREDENTIAL: pick your Airtable Personal Access Token here — left as a placeholder on purpose. BASE/TABLE: set to the real 'Email Drafts Pending Approval' table.",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "position": [
+        1408,
+        208
+      ],
+      "parameters": {
+        "operation": "update",
+        "base": {
+          "mode": "id",
+          "value": "appREPLACEWITHBASE",
+          "cachedResultName": "AI Customer Support Agent"
+        },
+        "table": {
+          "mode": "id",
+          "value": "tblREPLACEWITHTABL",
+          "cachedResultName": "Email Drafts Pending Approval"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Get Approved Unsent Drafts').item.json.id }}",
+            "Send Error": "={{ String($json.error || 'Unknown error sending reply') }}"
+          },
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true
+            },
+            {
+              "id": "Customer Email",
+              "displayName": "Customer Email",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Subject",
+              "displayName": "Subject",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Draft Body",
+              "displayName": "Draft Body",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Original Gmail Message ID",
+              "displayName": "Original Gmail Message ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Original Gmail Thread ID",
+              "displayName": "Original Gmail Thread ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Approved",
+              "displayName": "Approved",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Sent",
+              "displayName": "Sent",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Sent At",
+              "displayName": "Sent At",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Send Error",
+              "displayName": "Send Error",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable Personal Access Token"
+        }
+      }
+    },
+    {
+      "id": "wait_200ms_11",
+      "name": "Wait 200ms",
+      "webhookId": "df51c5a5-09df-57aa-ae39-696d56c09f19",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "amount": 0.2
+      }
+    }
+  ],
+  "connections": {
+    "Poll Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Get Approved Unsent Drafts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Approved Unsent Drafts": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Drafts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Drafts": {
+      "main": [
+        [
+          {
+            "node": "All Replies Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Approved Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Approved Reply": {
+      "main": [
+        [
+          {
+            "node": "Send OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send OK?": {
+      "main": [
+        [
+          {
+            "node": "Mark Draft as Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Send Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Draft as Sent": {
+      "main": [
+        [
+          {
+            "node": "Wait 200ms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Send Failure": {
+      "main": [
+        [
+          {
+            "node": "Wait 200ms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 200ms": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Drafts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "binaryMode": "separate"
+  },
+  "staticData": null
+}

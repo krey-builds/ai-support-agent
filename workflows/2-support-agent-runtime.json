@@ -1,0 +1,1719 @@
+{
+  "name": "2 - Support Agent Runtime",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP — status as of 2026-08-19\n\nThis workflow watches Gmail for new support messages, classifies them, answers from your Knowledge Base when it safely can, and escalates to you by email when it can't (or the customer sounds upset). Replies are NEVER sent from here — they're only ever drafted for you to approve (Workflow 3 sends those once you tick Approved).\n\n**v1 is email-only on purpose** — WhatsApp was scoped out to keep this portfolio build lean and demoable now rather than blocked on Meta's business verification. The classify → retrieve → ground → escalate pipeline is channel-agnostic, so adding WhatsApp (or any other channel) back later is a Normalize-node-and-a-branch away, not a rebuild.\n\n**Already wired, nothing left to configure:**\n- Gmail (\"Watch Support Inbox\", \"Send Escalation Alert\") -> AI GMAIL\n- Both Gemini Chat Model nodes + Gemini Embeddings -> Google Gemini API\n- \"Retrieve KB Matches\" -> Supabase API (Support Agent Knowledge Base)\n- Both Airtable nodes -> Airtable Personal Access Token (Support Agent), pointed at the real Support Agent base/tables\n- Escalation alerts send to you@example.com directly\n\n⚠️ LOAD-BEARING: the Gmail Trigger's search filter is `-from:me -from:mailer-daemon -from:postmaster -subject:\"Delivery Status Notification\"` on purpose. Never shorten it. `-from:me` stops this workflow's own escalation alerts being read back in as new inbound support messages; the mailer-daemon / postmaster / subject filters stop BOUNCED alerts doing the same.\n\n2026-08-23 incident: alerts were addressed to the inbox name with a one-letter typo, an address that does not exist. Every alert bounced back into this inbox from mailer-daemon, which is not `me`, so `-from:me` did not catch it and each bounce re-triggered the workflow. Self-feeding loop at 3 emails/min that drained the entire Gemini daily quota in ~10 minutes and wrote nothing to Airtable. Fixed at both ends: address corrected, bounce filters added.\n\n✅ VERIFIED 2026-08-24 (run 360) — and the assumption was WRONG. \"Retrieve KB Matches\" (Supabase Vector Store, Get Many mode) outputs items shaped `{ document: { pageContent, metadata }, score }`, NOT `{ pageContent, metadata }`. \"Combine KB Context\" was aggregating a top-level `pageContent` that never existed, so a retrieval returning 3 genuinely good matches aggregated to an empty array, \"KB Matches Found?\" said no, and the message escalated with \"No matching knowledge base entry found.\" Every answerable question would have escalated forever, looking like a knowledge-base problem rather than a field-name problem. Fixed by aggregating `document.pageContent` and renaming the output back to `pageContent`.\n\nWorkflow 1 (Embed Knowledge Base) must already have run at least once before this workflow can find anything.",
+        "height": 620,
+        "width": 980,
+        "color": 7
+      },
+      "id": "sticky_setup_40",
+      "name": "Sticky Note - SETUP",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        -900
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 1. Watch Support Inbox\nGmail Trigger feeds \"Normalize Gmail Input\", which maps the raw Gmail payload into one common shape (channel, from, message_text, thread_id, message_id, subject, received_at), then into \"Prepare Message Record\" — a deliberate pass-through node. EVERY node from here on reads fields via `$('Prepare Message Record')`, not `$('Normalize Gmail Input')` directly — kept this way even with a single trigger so re-adding a second channel later (e.g. WhatsApp) is a small, low-risk change rather than a rewrite of every downstream expression.\n\n\"Has Inbound Message?\" guards against a genuinely empty message body reaching the AI classify step — cheap insurance, costs nothing on the normal path.",
+        "height": 780,
+        "width": 1300,
+        "color": 4
+      },
+      "id": "sticky_section1_41",
+      "name": "Section - 1. Watch Support Inbox",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -680,
+        -220
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 2. Classify Intent & Escalation Risk\nOne Gemini call decides intent, urgency, whether the customer sounds angry, and whether this needs a human immediately (refunds, complaints, legal/medical language, low confidence). If the call itself fails, or if it says escalate, this goes straight to Section 5 — it never reaches the knowledge base or drafts an automated answer.",
+        "height": 720,
+        "width": 800,
+        "color": 5
+      },
+      "id": "sticky_section2_42",
+      "name": "Section - 2. Classify Intent & Escalation Risk",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        380,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 3. Retrieve Knowledge Base\nEmbeds the customer's message and searches Supabase for the 3 closest Knowledge Base entries (deterministic \"Get Many\" mode, NOT the agent-driven \"retrieve as tool\" mode — the rule \"if it's not in the KB, escalate\" is enforced here directly, not left to model judgment). \"Combine KB Context\" always produces exactly one output item, even when zero matches came back, so \"KB Matches Found?\" always has something to evaluate — an IF node fed by zero items would never fire either branch, which would silently drop the message.",
+        "height": 720,
+        "width": 720,
+        "color": 6
+      },
+      "id": "sticky_section3_43",
+      "name": "Section - 3. Retrieve Knowledge Base",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1180,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 4. Draft Grounded Reply\nDrafts a reply using ONLY the retrieved Knowledge Base text. The model also has to say whether its own answer was fully grounded in that context (`grounded`) — if it had to guess or infer anything beyond what the KB states, or if the call itself fails, this escalates instead of guessing at a customer.",
+        "height": 720,
+        "width": 740,
+        "color": 7
+      },
+      "id": "sticky_section4_44",
+      "name": "Section - 4. Draft Grounded Reply",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1940,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 5. Escalate\nFive different upstream checks can land here (classification call failed, classifier said escalate, no KB match found, answer call failed, answer not grounded) — each writes its own one-line reason first, then all five converge on \"Build Escalation Email\". That node is safe to read `Prepare Message Record` and `Classify Message` from because BOTH of those always run before ANY escalation path is reached, on every route in — so referencing them by name never crashes here. Sends one email to you at SUPPORT_ESCALATION_EMAIL; whether that send succeeds or fails, either way still gets logged.",
+        "height": 420,
+        "width": 3020,
+        "color": 3
+      },
+      "id": "sticky_section5_45",
+      "name": "Section - 5. Escalate",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        660,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### 6. Save Draft + Log\nA grounded, non-escalated reply is saved into \"Email Drafts Pending Approval\" for you to tick Approved on — nothing is ever sent automatically from this workflow. Workflow 3 (Send Approved Email Replies) sends it from there once approved.\n\nEvery path (draft saved, escalation sent, escalation failed) writes exactly one row to \"Log to Conversation Log\" — the single source of truth for what happened to every inbound message.",
+        "height": 600,
+        "width": 1000,
+        "color": 5
+      },
+      "id": "sticky_section6_46",
+      "name": "Section - 6. Save Draft + Log",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2660,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "event": "messageReceived",
+        "simple": true,
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "filters": {
+          "readStatus": "unread",
+          "q": "-from:me -from:mailer-daemon -from:postmaster -subject:\"Delivery Status Notification\" -category:promotions -category:social -category:updates -category:forums"
+        },
+        "options": {}
+      },
+      "id": "watch_support_inbox_0",
+      "name": "Watch Support Inbox",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -640,
+        -80
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "Gmail account"
+        }
+      },
+      "notes": "CREDENTIAL: \"AI GMAIL\" (you@example.com). Verify the attached account is THAT inbox — n8n's API auto-attaches an unrelated existing credential of the same type when one is given by name only.\n\nLOAD-BEARING SEARCH QUERY — never shorten it:\n  -from:me                              stops the agent's own escalation alerts re-triggering it\n  -from:mailer-daemon / -postmaster     stops BOUNCES re-triggering it\n  -subject:\"Delivery Status Notification\"  belt-and-braces on the same\n\n2026-08-23 incident: escalation alerts were addressed to the inbox name with a one-letter typo, an address that does not exist. Every alert bounced back INTO this inbox; the bounce was not from:me, so it re-triggered the workflow, which escalated again. Self-feeding loop, 3 emails/min, ran ~10 min and exhausted the Gemini daily quota. The address typo is fixed AND these bounce filters added, so the loop cannot restart from either end."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "channel",
+              "type": "string",
+              "value": "gmail"
+            },
+            {
+              "id": "a1",
+              "name": "from",
+              "type": "string",
+              "value": "={{ (function(){ var raw = $json.From || $json.from || ''; var m = raw.match(/<([^>]+)>/); return m ? m[1] : raw; })() }}"
+            },
+            {
+              "id": "a2",
+              "name": "message_text",
+              "type": "string",
+              "value": "={{ ($json.text || $json.textPlain || $json.snippet || '').replace(/&#39;/g, \"'\").replace(/&#39;/g, \"'\").replace(/&quot;/g, '\"').replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&') }}"
+            },
+            {
+              "id": "a3",
+              "name": "thread_id",
+              "type": "string",
+              "value": "={{ $json.threadId || '' }}"
+            },
+            {
+              "id": "a4",
+              "name": "message_id",
+              "type": "string",
+              "value": "={{ $json.id || '' }}"
+            },
+            {
+              "id": "a5",
+              "name": "subject",
+              "type": "string",
+              "value": "={{ $json.Subject || $json.subject || '' }}"
+            },
+            {
+              "id": "a6",
+              "name": "received_at",
+              "type": "string",
+              "value": "={{ $json.internalDate ? new Date(Number($json.internalDate)).toISOString() : ($json.date ? new Date($json.date).toISOString() : $now.toISO()) }}"
+            },
+            {
+              "id": "a7",
+              "name": "has_content",
+              "type": "boolean",
+              "value": true
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "normalize_gmail_input_2",
+      "name": "Normalize Gmail Input",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -380,
+        -80
+      ],
+      "notes": "Gmail Trigger only ever fires on a genuine new unread message matching the search filter, so has_content is always true here."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": []
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "prepare_message_record_4",
+      "name": "Prepare Message Record",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -120,
+        120
+      ],
+      "notes": "Pure pass-through merge point for both channels. Every downstream node reads fields from THIS node by name — never from the two Normalize nodes directly, since only one of them ran this execution."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !!$json.has_content }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "has_inbound_message_5",
+      "name": "Has Inbound Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        140,
+        120
+      ],
+      "notes": "Guard added beyond spec: drops WhatsApp status-update webhook fires (delivery/read receipts) before they waste an AI call or self-escalate. See Section 1 sticky."
+    },
+    {
+      "parameters": {},
+      "id": "ignore_no_message_content_6",
+      "name": "Ignore - No Message Content",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        420,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.5-flash",
+        "options": {}
+      },
+      "id": "google_gemini_chat_model_classify_7",
+      "name": "Google Gemini Chat Model (Classify)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        420,
+        560
+      ],
+      "retryOnFail": false,
+      "maxTries": 3,
+      "waitBetweenTries": 20000,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_ME",
+          "name": "Google Gemini API"
+        }
+      },
+      "notes": "CREDENTIAL: \"Google Gemini API\". Retry is deliberately OFF here — the parent agent node already retries 3x/20s, and retrying on BOTH layers multiplies one throttled message into up to 9 API calls, which burns the free daily allowance faster and deepens the 429. Let the agent own the retry."
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"required\": [\"intent\", \"urgency\", \"detected_anger\", \"escalate\", \"escalate_reason\", \"confidence\"],\n  \"properties\": {\n    \"intent\": { \"type\": \"string\", \"description\": \"Exactly one of: General Question, Pricing Question, Booking or Scheduling, Refund Request, Complaint, Legal or Medical Question, Other.\" },\n    \"urgency\": { \"type\": \"string\", \"description\": \"Exactly one of: Low, Medium, High. High means same-day response needed.\" },\n    \"detected_anger\": { \"type\": \"string\", \"description\": \"The literal string 'true' if the message shows frustration, anger, or hostile tone, otherwise the literal string 'false'.\" },\n    \"escalate\": { \"type\": \"string\", \"description\": \"The literal string 'true' if this is a refund request, a complaint, contains legal or medical language, detected_anger is true, or you are not confident enough to answer safely from a knowledge base. Otherwise the literal string 'false'.\" },\n    \"escalate_reason\": { \"type\": \"string\", \"description\": \"One short sentence explaining why escalate is true. Empty string if escalate is false.\" },\n    \"confidence\": { \"type\": \"number\", \"description\": \"0 to 1. Confidence this can be safely answered from a knowledge base without human review.\" }\n  }\n}"
+      },
+      "id": "classify_message_schema_8",
+      "name": "Classify Message Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        640,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Channel: {{ $('Prepare Message Record').item.json.channel }}\nFrom: {{ $('Prepare Message Record').item.json.from }}\nReceived: {{ $('Prepare Message Record').item.json.received_at }}\n\nMESSAGE:\n{{ $('Prepare Message Record').item.json.message_text }}\n\nProduce the required structured JSON output.",
+        "hasOutputParser": true,
+        "needsFallback": false,
+        "options": {
+          "systemMessage": "You triage ONE inbound customer support message for a small business. You do not answer it — you only classify it, so a downstream step can decide whether to answer from the knowledge base automatically or send it to a human.\n\nINTENT — exactly one of: General Question, Pricing Question, Booking or Scheduling, Refund Request, Complaint, Legal or Medical Question, Other.\n\nURGENCY — Low, Medium, or High. High means it genuinely needs a same-day response (an angry customer, a time-sensitive booking, a safety concern) — most General Questions are Low or Medium.\n\nESCALATE — set the literal string 'true' if ANY of the following hold, otherwise 'false':\n- it is a refund request\n- it is a complaint\n- it contains legal or medical language\n- detected_anger is 'true'\n- you are not confident a knowledge-base answer would be safe and accurate\nBe conservative: when in doubt, escalate. A human reading an unnecessary escalation costs a minute; an AI guessing wrong at a refund or a medical question costs trust.\n\nescalate_reason: one short, specific sentence a human could read in three seconds to know why this landed in their inbox. Empty string if escalate is 'false'.\n\nconfidence: your own honest 0 to 1 estimate that this specific message could be safely and completely answered from a knowledge base, without seeing the knowledge base yet — just based on how well-scoped and ordinary the question sounds.\n\nRespond only with the required JSON output."
+        }
+      },
+      "id": "classify_message_9",
+      "name": "Classify Message",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        420,
+        120
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 20000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.output && $json.output.confidence !== undefined }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ai_classify_call_ok_10",
+      "name": "AI Classify Call OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        700,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ String(($json.output && $json.output.escalate) || '') }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "escalate_immediately_11",
+      "name": "Escalate Immediately?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        940,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-embedding-001",
+        "options": {}
+      },
+      "id": "gemini_embeddings_query_12",
+      "name": "Gemini Embeddings (Query)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1220,
+        560
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_ME",
+          "name": "Google Gemini API"
+        }
+      },
+      "notes": "Must match the model used to build the embeddings in Workflow 1/4 — both default to gemini-embedding-001, which is actually 3072-dim (confirmed 2026-08-22; n8n's own node description wrongly claims 768)."
+    },
+    {
+      "parameters": {
+        "mode": "load",
+        "tableName": {
+          "mode": "id",
+          "value": "documents",
+          "cachedResultName": "documents"
+        },
+        "prompt": "={{ $('Prepare Message Record').item.json.message_text }}",
+        "topK": 3,
+        "options": {
+          "queryName": "match_documents"
+        }
+      },
+      "id": "retrieve_kb_matches_13",
+      "name": "Retrieve KB Matches",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.3,
+      "position": [
+        1220,
+        120
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_ME",
+          "name": "Supabase API"
+        }
+      },
+      "notes": "CREDENTIAL: select or create \"Supabase API\" here — left blank on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only. Table Name is a placeholder — repoint at your real `documents` table (see SETUP sticky). Get Many mode = deterministic retrieval, NOT retrieve-as-tool."
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateIndividualFields",
+        "fieldsToAggregate": {
+          "fieldToAggregate": [
+            {
+              "fieldToAggregate": "document.pageContent",
+              "renameField": true,
+              "outputFieldName": "pageContent"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "combine_kb_context_14",
+      "name": "Combine KB Context",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        1460,
+        120
+      ],
+      "notes": "Deliberately placed BEFORE \"KB Matches Found?\": Aggregate always emits exactly one item, even from zero input items, which guarantees the IF downstream always has something to evaluate. If it sat after the IF, a genuine zero-match retrieval would feed the IF zero items and NEITHER branch would fire, silently dropping the message.\n\n2026-08-24 — VERIFIED SHAPE (was flagged UNVERIFIED until run 360): `Retrieve KB Matches` (Supabase Vector Store) emits items shaped `{ document: { pageContent, metadata }, score }`, NOT `{ pageContent, metadata }`. This node was aggregating a top-level `pageContent` that never existed, so it output an empty array on a retrieval that had genuinely returned 3 good matches — and every answerable question escalated with \"No matching knowledge base entry found.\" Now aggregates `document.pageContent` and renames the output back to `pageContent` so the IF and the Draft Reply prompt keep working unchanged."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ Array.isArray($json.pageContent) && $json.pageContent.length > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "kb_matches_found_15",
+      "name": "KB Matches Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1700,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.7-flash",
+        "options": {}
+      },
+      "id": "google_gemini_chat_model_draft_16",
+      "name": "Google Gemini Chat Model (Draft)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1980,
+        560
+      ],
+      "retryOnFail": false,
+      "maxTries": 3,
+      "waitBetweenTries": 20000,
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_ME",
+          "name": "Google Gemini API"
+        }
+      },
+      "notes": "CREDENTIAL: \"Google Gemini API\". Retry is deliberately OFF here — the parent agent node already retries 3x/20s, and retrying on BOTH layers multiplies one throttled message into up to 9 API calls. Let the agent own the retry."
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"required\": [\"reply_text\", \"grounded\", \"grounding_gap\"],\n  \"properties\": {\n    \"reply_text\": { \"type\": \"string\", \"description\": \"The full reply to the customer, in the business's tone of voice as captured in the knowledge base answers. No invented facts.\" },\n    \"grounded\": { \"type\": \"string\", \"description\": \"'true' if every claim in reply_text is directly supported by the provided knowledge base context, otherwise 'false'. If you had to guess or infer policy beyond what the context states, this must be 'false'.\" },\n    \"grounding_gap\": { \"type\": \"string\", \"description\": \"If grounded is 'false', one sentence on what was missing. Empty string if grounded is 'true'.\" }\n  }\n}"
+      },
+      "id": "draft_reply_schema_17",
+      "name": "Draft Reply Schema",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        2200,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Channel: {{ $('Prepare Message Record').item.json.channel }}\nCustomer message:\n{{ $('Prepare Message Record').item.json.message_text }}\n\nKNOWLEDGE BASE CONTEXT (top matching entries):\n{{ ($('Combine KB Context').item.json.pageContent || []).join('\\n\\n---\\n\\n') }}\n\nProduce the required structured JSON output.",
+        "hasOutputParser": true,
+        "needsFallback": false,
+        "options": {
+          "systemMessage": "You write ONE reply to a customer support message, using ONLY the knowledge base context given below the message. This business has no other source of truth for you — never invent a policy, price, date, or promise that is not directly stated in the provided context.\n\nreply_text: the full reply, in plain, warm, professional language. Match whatever tone the knowledge base answers themselves are written in. Never pad it with hedging disclaimers like 'as an AI' or 'according to my knowledge base' — just answer, the way a well-briefed human support agent would.\n\ngrounded: the literal string 'true' only if every factual claim in reply_text is directly supported by the provided context. The literal string 'false' if you had to infer, guess, or generalise beyond what the context states, or if the context does not actually answer the question — even a mostly-correct answer with one invented detail must be marked 'false'.\n\ngrounding_gap: if grounded is 'false', one plain sentence on what information was missing. Empty string if grounded is 'true'.\n\nWhen the context does not cover the question, do not answer it anyway — write whatever honest, partial reply_text you can that stays inside the context (or state plainly you don't have that information), and mark grounded 'false' so a human follows up with the real answer.\n\nRespond only with the required JSON output."
+        }
+      },
+      "id": "draft_reply_18",
+      "name": "Draft Reply",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1980,
+        120
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 60000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.output && $json.output.grounded !== undefined }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ai_answer_call_ok_19",
+      "name": "AI Answer Call OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2220,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ String(($json.output && $json.output.grounded) || '') }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "reply_grounded_20",
+      "name": "Reply Grounded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2460,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": "Classification call failed after retries."
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "note_classification_call_failed_21",
+      "name": "Note - Classification Call Failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        700,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": "={{ ($json.output && $json.output.escalate_reason) || 'Classifier flagged this message for escalation.' }}"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "note_escalate_immediately_22",
+      "name": "Note - Escalate Immediately",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        940,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": "No matching knowledge base entry found."
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "note_no_kb_match_23",
+      "name": "Note - No KB Match",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1700,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": "Answer-drafting call failed after retries."
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "note_answer_call_failed_24",
+      "name": "Note - Answer Call Failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2220,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": "={{ ($json.output && $json.output.grounding_gap) || 'Draft reply was not fully grounded in the knowledge base.' }}"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "note_reply_not_grounded_25",
+      "name": "Note - Reply Not Grounded",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2460,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "alert_subject",
+              "type": "string",
+              "value": "={{ 'Support escalation (' + ($('Prepare Message Record').item.json.channel || 'unknown') + '): ' + (($('Prepare Message Record').item.json.subject || $('Prepare Message Record').item.json.message_text || '(no message text)').toString().substring(0, 60)) }}"
+            },
+            {
+              "id": "a1",
+              "name": "alert_body",
+              "type": "string",
+              "value": "={{ 'A support message needs your attention.\\n\\nChannel: ' + ($('Prepare Message Record').item.json.channel || '') + '\\nFrom: ' + ($('Prepare Message Record').item.json.from || '') + '\\nReceived: ' + ($('Prepare Message Record').item.json.received_at || '') + '\\n\\nReason: ' + ($json.escalation_reason || '') + '\\n\\nIntent: ' + (($('Classify Message').item.json.output && $('Classify Message').item.json.output.intent) || '(unknown)') + '\\nUrgency: ' + (($('Classify Message').item.json.output && $('Classify Message').item.json.output.urgency) || '(unknown)') + '\\nDetected anger: ' + (($('Classify Message').item.json.output && $('Classify Message').item.json.output.detected_anger) || '(unknown)') + '\\n\\nMESSAGE:\\n' + ($('Prepare Message Record').item.json.message_text || '') }}"
+            },
+            {
+              "id": "a2",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": "={{ $json.escalation_reason || '' }}"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "build_escalation_email_26",
+      "name": "Build Escalation Email",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2740,
+        760
+      ],
+      "notes": "Fan-in from 5 upstream checks: AI Classify Call OK=false, Escalate Immediately=true, KB Matches Found=false, AI Answer Call OK=false, Reply Grounded=false. Safe to reference Prepare Message Record and Classify Message by name here — both always execute before any of these 5 paths is reachable. Never references Draft Reply — that node has NOT executed on 3 of the 5 paths in, and referencing a node that did not run this execution crashes the workflow."
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "you@example.com",
+        "subject": "={{ $json.alert_subject }}",
+        "message": "={{ $json.alert_body }}",
+        "options": {}
+      },
+      "id": "send_escalation_alert_27",
+      "name": "Send Escalation Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2980,
+        760
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 10000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "Gmail account"
+        }
+      },
+      "notes": "CREDENTIAL: select or create \"Gmail OAuth2 (Support Agent)\" here — left blank on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only. Sends to SUPPORT_ESCALATION_EMAIL — set that env var in SETUP.",
+      "webhookId": "44af2a59-e299-5b3c-82d2-660076583d24"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ String(($json.id) || '') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "escalation_sent_ok_28",
+      "name": "Escalation Sent OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        3220,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "response_text",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "id": "a1",
+              "name": "response_status",
+              "type": "string",
+              "value": "Escalated"
+            },
+            {
+              "id": "a2",
+              "name": "escalated",
+              "type": "boolean",
+              "value": true
+            },
+            {
+              "id": "a3",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": "={{ $('Build Escalation Email').item.json.escalation_reason || '' }}"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "note_escalation_sent_29",
+      "name": "Note - Escalation Sent",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3460,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "response_text",
+              "type": "string",
+              "value": ""
+            },
+            {
+              "id": "a1",
+              "name": "response_status",
+              "type": "string",
+              "value": "Escalation Send Failed"
+            },
+            {
+              "id": "a2",
+              "name": "escalated",
+              "type": "boolean",
+              "value": true
+            },
+            {
+              "id": "a3",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": "={{ $('Build Escalation Email').item.json.escalation_reason || '' }}"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "note_escalation_send_failed_30",
+      "name": "Note - Escalation Send Failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3460,
+        860
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "mode": "id",
+          "value": "appREPLACEWITHBASE",
+          "cachedResultName": "AI Customer Support Agent"
+        },
+        "table": {
+          "mode": "id",
+          "value": "tblREPLACEWITHTABL",
+          "cachedResultName": "Email Drafts Pending Approval"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Customer Email": "={{ $('Prepare Message Record').item.json.from }}",
+            "Subject": "={{ 'Re: ' + ($('Prepare Message Record').item.json.subject || '(no subject)') }}",
+            "Draft Body": "={{ $('Draft Reply').item.json.output.reply_text }}",
+            "Original Gmail Message ID": "={{ $('Prepare Message Record').item.json.message_id }}",
+            "Original Gmail Thread ID": "={{ $('Prepare Message Record').item.json.thread_id }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Customer Email",
+              "displayName": "Customer Email",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Subject",
+              "displayName": "Subject",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Draft Body",
+              "displayName": "Draft Body",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Original Gmail Message ID",
+              "displayName": "Original Gmail Message ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Original Gmail Thread ID",
+              "displayName": "Original Gmail Thread ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "id": "save_draft_for_approval_36",
+      "name": "Save Draft for Approval",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        2940,
+        240
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable Personal Access Token"
+        }
+      },
+      "notes": "CREDENTIAL: select or create \"Airtable Personal Access Token (Support Agent)\" here — left blank on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only. BASE/TABLE: placeholder IDs — repoint at your real Support Agent base (see SETUP sticky). Writes ONLY these 5 fields — never Approved (operator-only) and never Sent / Sent At / Send Error (Workflow 3 owns those)."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a0",
+              "name": "response_text",
+              "type": "string",
+              "value": "={{ $('Draft Reply').item.json.output.reply_text }}"
+            },
+            {
+              "id": "a1",
+              "name": "response_status",
+              "type": "string",
+              "value": "Drafted-Pending-Approval"
+            },
+            {
+              "id": "a2",
+              "name": "escalated",
+              "type": "boolean",
+              "value": false
+            },
+            {
+              "id": "a3",
+              "name": "escalation_reason",
+              "type": "string",
+              "value": ""
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "note_draft_saved_37",
+      "name": "Note - Draft Saved",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3180,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "mode": "id",
+          "value": "appREPLACEWITHBASE",
+          "cachedResultName": "AI Customer Support Agent"
+        },
+        "table": {
+          "mode": "id",
+          "value": "tblREPLACEWITHTABL",
+          "cachedResultName": "Conversation Log"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Channel": "={{ $('Prepare Message Record').item.json.channel }}",
+            "From": "={{ $('Prepare Message Record').item.json.from }}",
+            "Message Text": "={{ $('Prepare Message Record').item.json.message_text }}",
+            "Received At": "={{ $('Prepare Message Record').item.json.received_at }}",
+            "Intent": "={{ ($('Classify Message').item.json.output && $('Classify Message').item.json.output.intent) || '' }}",
+            "Urgency": "={{ ($('Classify Message').item.json.output && $('Classify Message').item.json.output.urgency) || '' }}",
+            "Detected Anger": "={{ (function(){ var o = $('Classify Message').item.json.output; var v = o && o.detected_anger; return (v === true || v === 'true') ? 'true' : 'false'; })() }}",
+            "Escalated": "={{ $json.escalated ? 'true' : 'false' }}",
+            "Escalation Reason": "={{ $json.escalation_reason || '' }}",
+            "Response Text": "={{ $json.response_text || '' }}",
+            "Response Status": "={{ $json.response_status }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Channel",
+              "displayName": "Channel",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "From",
+              "displayName": "From",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Message Text",
+              "displayName": "Message Text",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Received At",
+              "displayName": "Received At",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Intent",
+              "displayName": "Intent",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Urgency",
+              "displayName": "Urgency",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Detected Anger",
+              "displayName": "Detected Anger",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Escalated",
+              "displayName": "Escalated",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Escalation Reason",
+              "displayName": "Escalation Reason",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Response Text",
+              "displayName": "Response Text",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Response Status",
+              "displayName": "Response Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Auto-Sent",
+                  "value": "Auto-Sent"
+                },
+                {
+                  "name": "Drafted-Pending-Approval",
+                  "value": "Drafted-Pending-Approval"
+                },
+                {
+                  "name": "Escalated",
+                  "value": "Escalated"
+                },
+                {
+                  "name": "Send Failed",
+                  "value": "Send Failed"
+                },
+                {
+                  "name": "Escalation Send Failed",
+                  "value": "Escalation Send Failed"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": true,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "typecast": true
+        }
+      },
+      "id": "log_to_conversation_log_38",
+      "name": "Log to Conversation Log",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        3740,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Airtable Personal Access Token"
+        }
+      },
+      "notes": "CREDENTIAL: select or create \"Airtable Personal Access Token (Support Agent)\" here — left blank on purpose, n8n's API auto-attaches an unrelated existing credential of the same type if one is provided by name only. BASE/TABLE: placeholder IDs — repoint at your real Support Agent base (see SETUP sticky). Fan-in from all 3 terminal branches: Draft Saved, Escalation Sent, Escalation Send Failed. (WhatsApp was cut from this build on 2026-08-19 — this note used to list 5 branches including its two, now stale and corrected.)"
+    },
+    {
+      "parameters": {
+        "amount": 0.2
+      },
+      "id": "wait_200ms_39",
+      "name": "Wait 200ms",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3980,
+        300
+      ],
+      "webhookId": "54e1ade0-ec5b-501a-8186-c508abc83772"
+    }
+  ],
+  "connections": {
+    "Watch Support Inbox": {
+      "main": [
+        [
+          {
+            "node": "Normalize Gmail Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Gmail Input": {
+      "main": [
+        [
+          {
+            "node": "Prepare Message Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Message Record": {
+      "main": [
+        [
+          {
+            "node": "Has Inbound Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Inbound Message?": {
+      "main": [
+        [
+          {
+            "node": "Classify Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ignore - No Message Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model (Classify)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Classify Message",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Message Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Classify Message",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Message": {
+      "main": [
+        [
+          {
+            "node": "AI Classify Call OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Classify Call OK?": {
+      "main": [
+        [
+          {
+            "node": "Escalate Immediately?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Note - Classification Call Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate Immediately?": {
+      "main": [
+        [
+          {
+            "node": "Note - Escalate Immediately",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retrieve KB Matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Embeddings (Query)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Retrieve KB Matches",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retrieve KB Matches": {
+      "main": [
+        [
+          {
+            "node": "Combine KB Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine KB Context": {
+      "main": [
+        [
+          {
+            "node": "KB Matches Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "KB Matches Found?": {
+      "main": [
+        [
+          {
+            "node": "Draft Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Note - No KB Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model (Draft)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Draft Reply",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Reply Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Draft Reply",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Reply": {
+      "main": [
+        [
+          {
+            "node": "AI Answer Call OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Answer Call OK?": {
+      "main": [
+        [
+          {
+            "node": "Reply Grounded?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Note - Answer Call Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reply Grounded?": {
+      "main": [
+        [
+          {
+            "node": "Save Draft for Approval",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Note - Reply Not Grounded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Note - Classification Call Failed": {
+      "main": [
+        [
+          {
+            "node": "Build Escalation Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Note - Escalate Immediately": {
+      "main": [
+        [
+          {
+            "node": "Build Escalation Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Note - No KB Match": {
+      "main": [
+        [
+          {
+            "node": "Build Escalation Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Note - Answer Call Failed": {
+      "main": [
+        [
+          {
+            "node": "Build Escalation Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Note - Reply Not Grounded": {
+      "main": [
+        [
+          {
+            "node": "Build Escalation Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Escalation Email": {
+      "main": [
+        [
+          {
+            "node": "Send Escalation Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Escalation Alert": {
+      "main": [
+        [
+          {
+            "node": "Escalation Sent OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalation Sent OK?": {
+      "main": [
+        [
+          {
+            "node": "Note - Escalation Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Note - Escalation Send Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Note - Escalation Sent": {
+      "main": [
+        [
+          {
+            "node": "Log to Conversation Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Note - Escalation Send Failed": {
+      "main": [
+        [
+          {
+            "node": "Log to Conversation Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Draft for Approval": {
+      "main": [
+        [
+          {
+            "node": "Note - Draft Saved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Note - Draft Saved": {
+      "main": [
+        [
+          {
+            "node": "Log to Conversation Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Conversation Log": {
+      "main": [
+        [
+          {
+            "node": "Wait 200ms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "staticData": null
+}

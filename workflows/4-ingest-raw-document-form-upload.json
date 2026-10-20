@@ -1,0 +1,257 @@
+{
+  "name": "4 - Ingest Raw Document (Form Upload)",
+  "nodes": [
+    {
+      "id": "sticky_setup_0",
+      "name": "Sticky Note - SETUP",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -620,
+        -560
+      ],
+      "parameters": {
+        "color": 7,
+        "width": 1000,
+        "height": 460,
+        "content": "## SETUP — what this workflow is for\n\nWorkflow 1 only reads clean Question/Answer rows you type into Airtable. Real clients hand over messy files — PDFs, Word docs, plain text policy dumps. This workflow proves the same knowledge base can learn directly from those, no manual retyping into rows.\n\nThis workflow is Active — open the Form Trigger node, copy its **Production URL**, open it in a browser. Upload a PDF, .docx, or .txt file. Extracts the text, splits it into chunks, embeds each chunk, and inserts them into the SAME Supabase `documents` table Workflow 1 uses — so Workflow 2 (the live agent) searches both sources together automatically.\n\n**This is ADDITIVE, not a rebuild** — unlike Workflow 1, it never wipes the table.\n\n**Credentials wired**: Gemini Embeddings -> Google Gemini API (pinned to `models/gemini-embedding-001`). Store Document Chunks -> Supabase API (Support Agent Knowledge Base).\n\n**Dimension fix, 2026-08-22**: this model outputs 3072-dimension vectors, not the 768 n8n's own node description claims. The Supabase `documents` table was originally built for 768 and every insert failed until the table itself was corrected (see `temp/outputs/supabase-fix-embedding-dimension.sql`) — the model was never wrong, the table was.\n\n**Confirmed working**: \"Load Uploaded Document\"'s Input Data Field Name (`data`) doesn't actually need to match the real binary property name (which turned out to be `Document`, not `data`) — Load All Input Data mode picks up any binary attachment on the item regardless of key name. No fix needed there.\n\n⚠️ Known limitation: no OCR — a scanned image PDF (not real selectable text) will extract empty. Typed/exported PDFs, Word docs, and plain text all work."
+      }
+    },
+    {
+      "id": "sticky_section1_1",
+      "name": "Section - 1. Upload",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -620,
+        -60
+      ],
+      "parameters": {
+        "color": 4,
+        "width": 480,
+        "height": 320,
+        "content": "### 1. Upload\nA simple web form — one file field. Submitting it starts this workflow with the file attached as binary data on the item. No Airtable row, no manual formatting required."
+      }
+    },
+    {
+      "id": "sticky_section2_2",
+      "name": "Section - 2. Chunk, Embed, Store",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -100,
+        -60
+      ],
+      "parameters": {
+        "color": 6,
+        "width": 1300,
+        "height": 320,
+        "content": "### 2. Chunk, Embed, Store\n\"Load Uploaded Document\" auto-detects the file type (PDF/DOCX/TXT) and extracts its text, using \"Split Document Text\" to break it into ~1000-character chunks with 150-character overlap (so a fact split across a chunk boundary still appears whole in at least one chunk). Each chunk gets embedded and inserted into the same `documents` table Workflow 1 populates — additive, never wiped."
+      }
+    },
+    {
+      "id": "upload_document_3",
+      "name": "Upload Document",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        -580,
+        120
+      ],
+      "parameters": {
+        "formTitle": "Upload a Knowledge Base Document",
+        "formDescription": "Upload a PDF, Word document, or text file — it will be read, chunked, and added to the AI Customer Support Agent's knowledge base.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Document",
+              "fieldType": "file",
+              "requiredField": true,
+              "multipleFiles": false,
+              "acceptFileTypes": ".pdf,.txt,.docx"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "webhookId": "bc1a9bf7-83d9-5665-bd93-c8b02f95a6c5"
+    },
+    {
+      "id": "split_document_text_4",
+      "name": "Split Document Text",
+      "type": "@n8n/n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter",
+      "typeVersion": 1,
+      "position": [
+        140,
+        220
+      ],
+      "parameters": {
+        "chunkSize": 1000,
+        "chunkOverlap": 150
+      }
+    },
+    {
+      "id": "load_uploaded_document_5",
+      "name": "Load Uploaded Document",
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1.1,
+      "position": [
+        140,
+        60
+      ],
+      "parameters": {
+        "dataType": "binary",
+        "binaryMode": "allInputData",
+        "binaryDataKey": "data",
+        "loader": "auto",
+        "textSplittingMode": "custom"
+      },
+      "notes": "CONFIRMED WORKING 2026-08-23 (see SETUP sticky): Input Data Field Name here says 'data', but the real binary property name is 'Document'. That mismatch does not matter — Load All Input Data mode picks up any binary attachment on the item regardless of key name. Proven live: 2 real documents ingested successfully."
+    },
+    {
+      "id": "gemini_embeddings_document_6",
+      "name": "Gemini Embeddings (Document)",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        440,
+        220
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "REPLACE_ME",
+          "name": "Google Gemini API"
+        }
+      },
+      "parameters": {
+        "modelName": "models/gemini-embedding-001"
+      }
+    },
+    {
+      "id": "store_document_chunks_7",
+      "name": "Store Document Chunks",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreSupabase",
+      "typeVersion": 1.3,
+      "position": [
+        440,
+        60
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 20000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_ME",
+          "name": "Supabase API"
+        }
+      },
+      "parameters": {
+        "mode": "insert",
+        "tableName": {
+          "mode": "id",
+          "value": "documents",
+          "cachedResultName": "documents"
+        },
+        "options": {}
+      },
+      "notes": "Insert mode only — never wipes the table. Additive to whatever Workflow 1 already embedded."
+    },
+    {
+      "id": "ingestion_complete_9",
+      "name": "Ingestion Complete",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        -40
+      ],
+      "parameters": {},
+      "notes": "Document's chunks are now searchable by Workflow 2. Check the Knowledge Base's new content by asking a question only this document could answer."
+    },
+    {
+      "id": "ingestion_failed_10",
+      "name": "Ingestion Failed - Check Execution Log",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        160
+      ],
+      "parameters": {},
+      "notes": "Open this execution and read the error on 'Store Document Chunks' — common causes: unsupported/corrupt file, empty extracted text (scanned image PDF with no OCR), or a Supabase auth issue."
+    }
+  ],
+  "connections": {
+    "Upload Document": {
+      "main": [
+        [
+          {
+            "node": "Store Document Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Document Text": {
+      "ai_textSplitter": [
+        [
+          {
+            "node": "Load Uploaded Document",
+            "type": "ai_textSplitter",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Uploaded Document": {
+      "ai_document": [
+        [
+          {
+            "node": "Store Document Chunks",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Embeddings (Document)": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Store Document Chunks",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Document Chunks": {
+      "main": [
+        [
+          {
+            "node": "Ingestion Complete",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ingestion Failed - Check Execution Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true
+  },
+  "staticData": null
+}
